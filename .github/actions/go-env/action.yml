@@ -1,0 +1,128 @@
+name: Go environment
+description: >-
+  Locate the Go module, install the exact Go version go.mod asks for, and
+  restore the module and build caches. Shared by every Go job so that the
+  toolchain and the cache layout cannot drift from one job to the next.
+
+# Why this exists instead of `actions/setup-go` with `cache: true`:
+# setup-go keys ONE cache on go.sum and shares it between every job. The first
+# job to finish saves it, the others find the key taken and save nothing. The
+# fastest job is never the one that compiles the most, so the shared cache held
+# the downloaded modules and almost no compiled package: every test and build
+# job recompiled the whole dependency tree on each run (12 minutes of tests
+# measured for 45 seconds of actual work).
+#
+# Here each job names its own build cache, and the module download cache is a
+# separate entry keyed on go.sum alone.
+
+inputs:
+  build-cache:
+    description: >-
+      Name of the build cache to restore, one per kind of compilation
+      (for example "test-race" or "build-linux-amd64"). Leave empty for no
+      build cache.
+    required: false
+    default: ''
+  module-cache:
+    description: Restore the module download cache ("true" or "false").
+    required: false
+    default: 'true'
+
+outputs:
+  module-dir:
+    description: Directory that holds go.mod, relative to the workspace.
+    value: ${{ steps.locate.outputs.dir }}
+  mod-path:
+    description: Absolute path of the module download cache.
+    value: ${{ steps.paths.outputs.mod }}
+  mod-key:
+    description: Key of the module download cache.
+    value: ${{ steps.keys.outputs.mod }}
+  mod-hit:
+    description: '"true" when the module cache was restored from its exact key.'
+    value: ${{ steps.mod.outputs.cache-hit }}
+  build-path:
+    description: Absolute path of the build cache.
+    value: ${{ steps.paths.outputs.build }}
+  build-key:
+    description: Key of the build cache.
+    value: ${{ steps.keys.outputs.build }}
+  build-hit:
+    description: '"true" when the build cache was restored from its exact key.'
+    value: ${{ steps.build.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    # The module sits at the repository root in the published repository and
+    # under public/ in the source repository. Every workflow is the same file
+    # in both, so the location is discovered instead of written down.
+    - name: Locate the Go module
+      id: locate
+      shell: bash
+      run: |
+        if [ -f go.mod ]; then
+          dir=. ; prefix=
+        elif [ -f public/go.mod ]; then
+          dir=public ; prefix=public/
+        else
+          echo "::error title=Go module::No go.mod at the repository root or under public/."
+          exit 1
+        fi
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "MODULE_DIR=$dir" >> "$GITHUB_ENV"
+
+    - name: Install Go
+      id: go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: ${{ steps.locate.outputs.dir }}/go.mod
+        cache: false
+
+    # GOTOOLCHAIN=local: `go` must never download another toolchain behind our
+    # back. A toolchain fetched into the module cache before the cache is
+    # restored is what made the restore fail with "tar: File exists".
+    - name: Resolve cache paths
+      id: paths
+      shell: bash
+      env:
+        GOTOOLCHAIN: local
+      run: |
+        echo "mod=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+        echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+        echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+
+    - name: Compute cache keys
+      id: keys
+      shell: bash
+      env:
+        SUM_HASH: ${{ hashFiles(format('{0}go.sum', steps.locate.outputs.prefix)) }}
+        SRC_HASH: ${{ hashFiles(format('{0}**/*.go', steps.locate.outputs.prefix), format('{0}go.mod', steps.locate.outputs.prefix), format('{0}go.sum', steps.locate.outputs.prefix)) }}
+        GO_VERSION: ${{ steps.go.outputs.go-version }}
+        BUILD_CACHE: ${{ inputs.build-cache }}
+      run: |
+        echo "mod=gomod-${RUNNER_OS}-${SUM_HASH}" >> "$GITHUB_OUTPUT"
+        echo "build-prefix=gobuild-${BUILD_CACHE}-${RUNNER_OS}-go${GO_VERSION}-" >> "$GITHUB_OUTPUT"
+        echo "build=gobuild-${BUILD_CACHE}-${RUNNER_OS}-go${GO_VERSION}-${SRC_HASH}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore module cache
+      id: mod
+      if: inputs.module-cache == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.paths.outputs.mod }}
+        key: ${{ steps.keys.outputs.mod }}
+
+    # The key ends with a hash of the sources, so an unchanged tree hits its
+    # exact key and nothing is saved again. Any other run falls back to the
+    # most recent cache of the same kind: only the packages that changed are
+    # recompiled, and only their tests are run again.
+    - name: Restore build cache
+      id: build
+      if: inputs.build-cache != ''
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.paths.outputs.build }}
+        key: ${{ steps.keys.outputs.build }}
+        restore-keys: ${{ steps.keys.outputs.build-prefix }}

@@ -1,0 +1,8 @@
+# Keeps the build context small and the layer cache stable: none of this is
+# compiled into the binary.
+.git
+.github
+dist
+docs
+*.md
+docker-compose.yml

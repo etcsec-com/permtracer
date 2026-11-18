@@ -1,0 +1,106 @@
+name: Docker image
+
+# Builds the image and checks that it starts. It used to run on every push,
+# five minutes each time, and its layer cache took most of the repository's
+# cache quota. The Go code is already compiled by ci.yml: what this adds is the
+# Dockerfile itself, so it runs when the Dockerfile or its inputs change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'go.mod'
+      - 'go.sum'
+      - 'public/Dockerfile'
+      - 'public/.dockerignore'
+      - 'public/go.mod'
+      - 'public/go.sum'
+      - '.github/workflows/docker.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'go.mod'
+      - 'go.sum'
+      - 'public/Dockerfile'
+      - 'public/.dockerignore'
+      - 'public/go.mod'
+      - 'public/go.sum'
+      - '.github/workflows/docker.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The build context is the module root: `COPY go.mod go.sum ./`.
+      - name: Locate the build context
+        id: ctx
+        run: |
+          if [ -f Dockerfile ]; then echo "dir=." >> "$GITHUB_OUTPUT"
+          elif [ -f public/Dockerfile ]; then echo "dir=public" >> "$GITHUB_OUTPUT"
+          else echo "::error title=Docker::No Dockerfile at the root or under public/."; exit 1
+          fi
+
+      # Only the few package-install lines of the runtime stage run under
+      # emulation; the Go compilation is native (see the Dockerfile).
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      # One build step at a time. Compiling the two architectures side by side
+      # needs more memory than a runner has; one after the other, each fits.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 1
+
+      # Same platforms and same builder settings as the release job, so the
+      # image the release pushes has been built here first.
+      - name: Build both architectures
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ steps.ctx.outputs.dir }}
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            VERSION=0.0.0-ci
+
+      # Served from the layers built just above.
+      - name: Load the amd64 image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ steps.ctx.outputs.dir }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          build-args: |
+            VERSION=0.0.0-ci
+          tags: permtracer:ci
+
+      # An image that builds and cannot start is the failure this job exists
+      # for. The version check also proves the build argument reaches the
+      # binary: a published image once answered "version dev".
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm permtracer:ci --version)"
+          echo "$out"
+          case "$out" in
+            *0.0.0-ci*) ;;
+            *) echo "::error title=Docker::The image does not report the version it was built with."; exit 1 ;;
+          esac

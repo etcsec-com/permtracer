@@ -1,0 +1,198 @@
+name: CI
+
+# This file is byte-identical in the source repository (.github/workflows/) and
+# in the published one. The Go module sits under public/ in the first and at
+# the root in the second: the go-env action discovers which. Two hand-maintained
+# copies drifted for months (one kept a Go version that go.mod had outgrown).
+#
+# What runs where:
+#   ci.yml        every push and pull request: guards, tests, builds, lint
+#   security.yml  vulnerability scan: daily, on dependency changes, at release
+#   docker.yml    image build, only when the image inputs change
+#   release.yml   tags
+
+on:
+  push:
+    branches: [main]
+    # Measurement records only. Nothing under this path is compiled, embedded
+    # or read by a test. Every other path stays in: several tests read the
+    # README, the changelog and the generated catalogs.
+    paths-ignore:
+      - 'docs/security-validation/**'
+  pull_request:
+    paths-ignore:
+      - 'docs/security-validation/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A run that has started on main always finishes, so every verdict lands. While
+# it runs, only the most recent waiting push is kept. Pull requests cancel the
+# run of the commit they replace.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  guards:
+    name: Guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Source repository only: the release must fail when it cannot sign, and
+      # the workflow copies must be identical. The published repository
+      # receives files that have already passed this check.
+      - name: Signing guard and workflow parity
+        run: |
+          set -euo pipefail
+          if [ -f public/go.mod ]; then
+            ./scripts/test-signing-guard.sh
+          else
+            echo "Published layout: this guard runs in the source repository."
+          fi
+
+      # The GUI's JavaScript is embedded with go:embed. A syntax error in it
+      # compiles perfectly and breaks the whole GUI at runtime. `go build`
+      # cannot see that; `node --check` can.
+      - name: Embedded JavaScript syntax
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(internal/web/static/*.js public/internal/web/static/*.js)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error title=Embedded JS::No JavaScript found under internal/web/static/. The glob or the layout changed."
+            exit 1
+          fi
+          rc=0
+          for f in "${files[@]}"; do
+            if node --check "$f"; then
+              echo "  OK    $f"
+            else
+              echo "::error file=$f,title=Embedded JS::Syntax error. This compiles fine and breaks the GUI at runtime."
+              rc=1
+            fi
+          done
+          exit $rc
+
+  test:
+    name: Test (race detector)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Go environment
+        id: go
+        uses: ./.github/actions/go-env
+        with:
+          build-cache: test-race
+
+      # No -coverprofile: the profile was uploaded as an artifact nobody read,
+      # it slows every package down, and it keeps `go test` from reusing the
+      # result of a package that did not change.
+      - name: Run tests
+        working-directory: ${{ env.MODULE_DIR }}
+        run: go test -race ./...
+
+      # Saved even when a test fails: the compiled packages are still valid,
+      # and the run that fixes the test is the one that most needs to be fast.
+      - name: Save module cache
+        if: ${{ !cancelled() && steps.go.outputs.mod-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.mod-path }}
+          key: ${{ steps.go.outputs.mod-key }}
+
+      - name: Save build cache
+        if: ${{ !cancelled() && steps.go.outputs.build-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.build-path }}
+          key: ${{ steps.go.outputs.build-key }}
+
+  # Not gated on `test`: a compile error and a failing test are two separate
+  # answers, and waiting for one before asking for the other only added the
+  # duration of the tests to every run.
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every release target on main; linux/amd64 alone on pull requests.
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"goos":"linux","goarch":"amd64"}]' || '[{"goos":"linux","goarch":"amd64"},{"goos":"linux","goarch":"arm64"},{"goos":"darwin","goarch":"amd64"},{"goos":"darwin","goarch":"arm64"},{"goos":"windows","goarch":"amd64"}]') }}
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Go environment
+        id: go
+        uses: ./.github/actions/go-env
+        with:
+          build-cache: build-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      # Type-checks every package AND its tests for this target. The test job
+      # only compiles for linux/amd64, so a test file that no longer builds on
+      # Windows or macOS would otherwise go unnoticed.
+      - name: Vet
+        working-directory: ${{ env.MODULE_DIR }}
+        run: go vet -trimpath ./...
+
+      # Same flags as the release build, minus the version stamp.
+      - name: Build
+        working-directory: ${{ env.MODULE_DIR }}
+        run: go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/permtracer-build" ./cmd/permtracer
+
+      - name: Save build cache
+        if: ${{ !cancelled() && steps.go.outputs.build-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.build-path }}
+          key: ${{ steps.go.outputs.build-key }}
+
+  # Blocking. The files that predate this rule and are not formatted yet are
+  # listed one by one in .golangci.yml; nothing else is exempt.
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The linter type-checks the whole module, which compiles it: without a
+      # build cache of its own this job spent four minutes doing that again.
+      - name: Go environment
+        id: go
+        uses: ./.github/actions/go-env
+        with:
+          build-cache: lint
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # Pinned: `latest` breaks on the next major, and the configuration
+          # uses the v2 schema.
+          version: v2.15.0
+          working-directory: ${{ env.MODULE_DIR }}
+
+      - name: Save build cache
+        if: ${{ !cancelled() && steps.go.outputs.build-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.build-path }}
+          key: ${{ steps.go.outputs.build-key }}

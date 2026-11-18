@@ -1,0 +1,503 @@
+name: Release
+
+# Byte-identical in the source repository and in the published one (see ci.yml).
+#
+# A tag publishes. A manual run is a DRY RUN: it builds every target, signs the
+# Windows binary when a signing identity exists, packages and checks the
+# archives, logs in to the image registries when their credentials exist and
+# builds the image, then stops. Nothing is published, nothing is written to a
+# transparency log, no image is pushed. Use it to prove the pipeline works
+# before the tag that needs it: a release is rehearsed first, tagged once.
+#
+# No job that produces a shipped file restores a cache: binaries and image are
+# built from the tagged sources and from modules verified against go.sum, never
+# from what an earlier run left behind. The test job ships nothing, so it reuses
+# the packages CI already compiled (read-only) instead of spending ten minutes
+# rebuilding them.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Fail-closed gate. Runs before anything is built, so a release that cannot
+  # be signed dies in seconds instead of after the builds.
+  #
+  # The preflight looks for an Azure Trusted Signing identity (AZURE_CLIENT_ID,
+  # scoped to the 'release' environment). Without one the run fails, unless
+  # ALLOW_UNSIGNED_RELEASE is set on purpose. A dry run publishes nothing, so it
+  # is allowed to go on unsigned: that is what lets it run where no identity
+  # exists.
+  signing-preflight:
+    name: "Preflight - release signing"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ALLOW_UNSIGNED_RELEASE: ${{ github.event_name == 'workflow_dispatch' && 'true' || vars.ALLOW_UNSIGNED_RELEASE }}
+    outputs:
+      mode: ${{ steps.guard.outputs.mode }}
+      publish: ${{ steps.plan.outputs.publish }}
+      version: ${{ steps.plan.outputs.version }}
+      registries: ${{ steps.plan.outputs.registries }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Signing guard (signed, or the release fails)
+        id: guard
+        run: ./scripts/lib/signing.sh preflight "release"
+
+      # The one place that decides whether this run publishes and which version
+      # it stamps. Every other job reads these two outputs.
+      - name: Release plan
+        id: plan
+        env:
+          HAS_REGISTRY_CREDENTIALS: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          # Only tells a dry run whether the image job can rehearse its logins.
+          # A real release runs that job regardless, and fails there if the
+          # credentials are missing.
+          echo "registries=${HAS_REGISTRY_CREDENTIALS}" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "Publishing ${GITHUB_REF_NAME}."
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Dry run::Nothing will be published."
+          fi
+
+  tests:
+    name: "Run tests"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Restored, never saved from here.
+      - name: Go environment
+        uses: ./.github/actions/go-env
+        with:
+          build-cache: test-race
+
+      - name: Run tests
+        working-directory: ${{ env.MODULE_DIR }}
+        run: go test -race ./...
+
+  vulnerability-scan:
+    name: "Vulnerability scan"
+    uses: ./.github/workflows/security.yml
+
+  build:
+    name: "Build ${{ matrix.goos }}/${{ matrix.goarch }}"
+    needs: [signing-preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Go environment
+        uses: ./.github/actions/go-env
+        with:
+          module-cache: 'false'
+
+      - name: Build
+        working-directory: ${{ env.MODULE_DIR }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          VERSION: ${{ needs.signing-preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "$GITHUB_WORKSPACE/dist/permtracer-${GOOS}-${GOARCH}" \
+            ./cmd/permtracer
+
+      - name: Upload binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/permtracer-${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  build-windows:
+    name: "Build and sign windows/amd64"
+    needs: [signing-preflight]
+    runs-on: windows-2025
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      # Required for the azure/login OIDC token exchange with Entra ID.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Go environment
+        uses: ./.github/actions/go-env
+        with:
+          module-cache: 'false'
+
+      - name: Build Windows binary
+        shell: bash
+        working-directory: ${{ env.MODULE_DIR }}
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+          VERSION: ${{ needs.signing-preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          go build -trimpath -ldflags="${LDFLAGS}" \
+            -o "$GITHUB_WORKSPACE/dist/permtracer-windows-amd64.exe" \
+            ./cmd/permtracer
+
+      # OIDC federated login: no secret. The GitHub Actions ID token is
+      # exchanged for an Azure access token. The federation is tied to the
+      # 'release' environment, so the token can only be issued to a job that
+      # declares `environment: release`.
+      - name: Azure login (OIDC federated)
+        if: needs.signing-preflight.outputs.mode == 'signed'
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Trusted Signing issues a fresh short-lived leaf certificate per call.
+      # No PFX, no password, no renewal: the chain root (Microsoft ID Verified
+      # Code Signing PCA) is already trusted on every supported Windows.
+      # The action's repository was renamed (trusted-signing-action ->
+      # artifact-signing-action). The old name only answers through a redirect,
+      # and not at all for a commit hash: use the current name.
+      - name: Sign Windows binary (Azure Trusted Signing)
+        if: needs.signing-preflight.outputs.mode == 'signed'
+        uses: azure/artifact-signing-action@0d74250c661747df006298d0fb49944c10f16e03 # v0.5.1
+        with:
+          endpoint: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.TRUSTED_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Post-sign verification. Without it, an action that fails quietly (or
+      # turns into a no-op after an API change) still yields a green build.
+      # Get-AuthenticodeSignature is the Windows authority here: the status
+      # must be Valid and the signer subject must be ETCSEC.
+      - name: Verify Windows signature
+        if: needs.signing-preflight.outputs.mode == 'signed'
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $exe = "dist/permtracer-windows-amd64.exe"
+          $sig = Get-AuthenticodeSignature $exe
+          Write-Host "Status:                 $($sig.Status)"
+          Write-Host "StatusMessage:          $($sig.StatusMessage)"
+          Write-Host "SignerCertificate:      $($sig.SignerCertificate.Subject)"
+          Write-Host "TimeStamperCertificate: $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') {
+            Write-Error "Post-sign verification FAILED: status=$($sig.Status), message=$($sig.StatusMessage)"
+            exit 1
+          }
+          if ($sig.SignerCertificate.Subject -notmatch 'CN=ETCSEC') {
+            Write-Error "Signer certificate subject does not match ETCSEC: $($sig.SignerCertificate.Subject)"
+            exit 1
+          }
+          if ($sig.TimeStamperCertificate -eq $null) {
+            Write-Error "Signature is not timestamped. Untimestamped signatures die with the leaf cert's 72h validity."
+            exit 1
+          }
+
+      - name: Mark build as deliberately unsigned
+        if: needs.signing-preflight.outputs.mode != 'signed'
+        shell: bash
+        run: |
+          echo "::warning title=Release signing::Windows binary built UNSIGNED (dry run, or ALLOW_UNSIGNED_RELEASE is set)."
+
+      - name: Upload binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-windows-amd64
+          path: dist/permtracer-windows-amd64.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # Everything that can refuse a release is a dependency of this job: signing,
+  # tests, the vulnerability scan and every build.
+  create-release:
+    name: "Package and publish"
+    needs: [signing-preflight, tests, vulnerability-scan, build, build-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      # Required for cosign keyless signing (Sigstore/Fulcio via GitHub OIDC).
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ needs.signing-preflight.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bin-*
+          path: artifacts
+
+      # Artifacts do not carry Unix permissions, so the execute bit is set
+      # again here. Two releases shipped a binary that had to be chmod-ed by
+      # hand before this was done.
+      - name: Package archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; do
+            stage="permtracer-${RELEASE_VERSION}-${target}"
+            mkdir -p "dist/${stage}"
+            if [ "$target" = "windows-amd64" ]; then
+              cp "artifacts/bin-${target}/permtracer-${target}.exe" "dist/${stage}/permtracer.exe"
+              (cd dist && zip -qr "release/${stage}.zip" "${stage}")
+            else
+              cp "artifacts/bin-${target}/permtracer-${target}" "dist/${stage}/permtracer"
+              chmod 755 "dist/${stage}/permtracer"
+              (cd dist && tar czf "release/${stage}.tar.gz" "${stage}")
+            fi
+          done
+          ls -l dist/release
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist/release
+          sha256sum -- *.tar.gz *.zip > checksums.sha256
+          cat checksums.sha256
+
+      # What a user does first, done here before anything is published: check
+      # the sums, extract, run. Each defect this catches has shipped once.
+      - name: Check the archives
+        run: |
+          set -euo pipefail
+          cd dist/release
+          tars=(*.tar.gz) ; zips=(*.zip)
+          [ "${#tars[@]}" -eq 4 ] || { echo "::error title=Release::Expected 4 .tar.gz archives."; exit 1; }
+          [ "${#zips[@]}" -eq 1 ] || { echo "::error title=Release::Expected 1 .zip archive."; exit 1; }
+          sha256sum --check --strict checksums.sha256
+          for a in "${tars[@]}"; do
+            listing="$(tar tvzf "$a")"
+            if ! grep -E '/permtracer$' <<<"$listing" | grep -q '^-rwxr-xr-x'; then
+              echo "::error title=Release::$a: the binary is not executable inside the archive."
+              exit 1
+            fi
+          done
+          listing="$(unzip -l "permtracer-${RELEASE_VERSION}-windows-amd64.zip")"
+          grep -q 'permtracer\.exe$' <<<"$listing" \
+            || { echo "::error title=Release::The Windows archive does not contain permtracer.exe."; exit 1; }
+          work="$(mktemp -d)"
+          tar xzf "permtracer-${RELEASE_VERSION}-linux-amd64.tar.gz" -C "$work"
+          out="$("$work/permtracer-${RELEASE_VERSION}-linux-amd64/permtracer" --version)"
+          echo "$out"
+          case "$out" in
+            *"${RELEASE_VERSION}"*) ;;
+            *) echo "::error title=Release::The binary does not report version ${RELEASE_VERSION}."; exit 1 ;;
+          esac
+
+      - name: Install cosign
+        if: needs.signing-preflight.outputs.publish == 'true'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      # checksums.sha256 travels over the same channel as the artifacts, so by
+      # itself it proves nothing against a compromised mirror. This detached
+      # Sigstore signature is verifiable independently of the download channel.
+      # Keyless signing uses the job's OIDC token: no pre-provisioned secret.
+      # Skipped on a dry run: a keyless signature is a permanent public record.
+      - name: Sign checksums (detached, Sigstore keyless)
+        if: needs.signing-preflight.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          . ./scripts/lib/signing.sh
+          signing_sign_checksums dist/release/checksums.sha256
+
+      - name: Mark release as deliberately unsigned
+        if: needs.signing-preflight.outputs.mode != 'signed'
+        run: |
+          set -euo pipefail
+          . ./scripts/lib/signing.sh
+          signing_write_unsigned_marker dist/release
+
+      - name: Keep the dry-run archives for inspection
+        if: needs.signing-preflight.outputs.publish != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dry-run
+          path: dist/release
+          retention-days: 1
+
+      - name: Create GitHub Release
+        if: needs.signing-preflight.outputs.publish == 'true' && github.event_name == 'push'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/release/*.tar.gz
+            dist/release/*.zip
+            dist/release/checksums.sha256
+            dist/release/checksums.sha256.bundle
+            dist/release/UNSIGNED*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # After the release, never before: an image problem must not hold back the
+  # signed binaries. The image is compiled for both architectures by the build
+  # stage itself (see the Dockerfile); QEMU only runs the few package-install
+  # lines of the runtime stage.
+  #
+  # On a dry run it still logs in to both registries and builds both
+  # architectures, without pushing: an expired registry token is found at the
+  # rehearsal, not after the release is out.
+  docker:
+    name: "Docker image"
+    needs: [signing-preflight, create-release]
+    if: needs.signing-preflight.outputs.publish == 'true' || needs.signing-preflight.outputs.registries == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Locate the build context
+        id: ctx
+        run: |
+          if [ -f Dockerfile ]; then echo "dir=." >> "$GITHUB_OUTPUT"
+          elif [ -f public/Dockerfile ]; then echo "dir=public" >> "$GITHUB_OUTPUT"
+          else echo "::error title=Docker::No Dockerfile at the root or under public/."; exit 1
+          fi
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      # One build step at a time: compiling the two architectures side by side
+      # needs more memory than a runner has. Same settings as docker.yml.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 1
+
+      # GHCR_TOKEN when it exists: the automatic token is refused on a package
+      # that is not linked to this repository.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # A login only proves the credentials are valid, not that they may write.
+      # Opening an upload session is the first thing a push does and uploads
+      # nothing: the registry answers 202 when the push would be accepted.
+      - name: Check push permission on both registries (dry run, nothing is uploaded)
+        if: needs.signing-preflight.outputs.publish != 'true'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          GHCR_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          probe() { # label, token endpoint, registry, repository, user, secret
+            local label="$1" auth="$2" registry="$3" repo="$4" user="$5" secret="$6" token code
+            token="$(curl -sS -u "${user}:${secret}" "${auth}&scope=repository:${repo}:pull,push" | jq -r '.token // .access_token // empty' 2>/dev/null)"
+            if [ -z "$token" ]; then
+              echo "::error title=Registry::${label}: no token issued for ${repo}."
+              return 1
+            fi
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${token}" "${registry}/v2/${repo}/blobs/uploads/")"
+            if [ "$code" = "202" ]; then
+              echo "${label}: push allowed on ${repo}"
+            else
+              echo "::error title=Registry::${label}: push refused on ${repo} (HTTP ${code})."
+              return 1
+            fi
+          }
+          rc=0
+          probe "Docker Hub" "https://auth.docker.io/token?service=registry.docker.io" "https://registry-1.docker.io" "etcseccom/permtracer" "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" || rc=1
+          probe "GHCR" "https://ghcr.io/token?service=ghcr.io" "https://ghcr.io" "$GHCR_REPOSITORY" "$GHCR_USERNAME" "$GHCR_TOKEN" || rc=1
+          exit $rc
+
+      - name: Image names and tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            etcseccom/permtracer
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      # VERSION is the tag without its "v": without this argument the image
+      # falls back to "dev" and lies about its own version.
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ steps.ctx.outputs.dir }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.signing-preflight.outputs.publish == 'true' && github.event_name == 'push' }}
+          build-args: |
+            VERSION=${{ needs.signing-preflight.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

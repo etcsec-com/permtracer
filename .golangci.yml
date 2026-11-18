@@ -1,0 +1,51 @@
+version: "2"
+
+# Same linter set as the former v1 configuration: v1's "enable" list minus
+# errcheck/unused (still disabled - too many existing findings). gosimple is
+# part of staticcheck in v2 and gofmt is a formatter, so the S* checks and the
+# gofmt check are expressed below. Check selection is pinned to SA*/S* so
+# that the stylecheck (ST*) and quickfix (QF*) checks that v2 folded into
+# staticcheck are NOT silently added.
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - ineffassign
+  settings:
+    staticcheck:
+      checks:
+        - "SA*"
+        - "-SA9003" # Ignore les avertissements de branches vides
+        - "S1*"
+        - "-S1009"  # Ignore vérifications nil
+        - "-S1011"  # Ignore simplifications de boucles
+  exclusions:
+    paths:
+      - vendor
+
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    paths:
+      - vendor
+      # Not formatted yet, and left untouched on purpose: each of these belongs
+      # to a detector whose validated state is tied to its exact content.
+      # Format the file and delete its line when the detector is next revised.
+      # Nothing else is exempt, and lint blocks the pipeline.
+      - internal/audit/detectors/ad/compliance/anssi/anssi-r36-1-laps-expiry-too-long-on-disabled-account_test\.go$
+      - internal/audit/detectors/ad/compliance/anssi/anssi-r42-trust-password-old\.go$
+      - internal/audit/detectors/ad/compliance/anssi/anssi-r42-trust-password-old_test\.go$
+      - internal/audit/detectors/ad/compliance/anssi/r5-segregation_test\.go$
+      - internal/audit/detectors/ad/computers/delegation/constrained-delegation-on-disabled-account_test\.go$
+      - internal/audit/detectors/ad/groups/nesting/circular-nesting_test\.go$
+      - internal/audit/detectors/ad/password/service-account-weak-password-policy-on-disabled-account_test\.go$
+      - internal/audit/detectors/ad/permissions/moderate/force-change-password_test\.go$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+run:
+  timeout: 5m

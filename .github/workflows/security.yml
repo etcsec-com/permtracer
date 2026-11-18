@@ -1,0 +1,94 @@
+name: Security scan
+
+# Known-vulnerability scan (govulncheck), on its own schedule.
+#
+# It used to be a blocking job of the CI pipeline. A vulnerability is published
+# on its own date, not when someone pushes: when a new one landed in the Go
+# standard library, every push went red until the toolchain was bumped, whatever
+# the push contained. Real test failures were hidden behind that red for weeks.
+#
+# It now runs:
+#   - every day, so a new advisory is seen within 24 hours even without a push;
+#   - when go.mod or go.sum changes, the only pushes that can change the answer;
+#   - as a required job of release.yml, so nothing ships with a reachable,
+#     unaccepted vulnerability.
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'public/go.mod'
+      - 'public/go.sum'
+      - '.github/workflows/security.yml'
+      - '.github/actions/go-env/**'
+  pull_request:
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'public/go.mod'
+      - 'public/go.sum'
+      - '.github/workflows/security.yml'
+      - '.github/actions/go-env/**'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No cache: this job also gates the release, and a release must not
+      # depend on anything an earlier run left behind.
+      - name: Go environment
+        uses: ./.github/actions/go-env
+        with:
+          module-cache: 'false'
+
+      - name: Run govulncheck
+        working-directory: ${{ env.MODULE_DIR }}
+        run: |
+          # `set +e` is required. GitHub starts every `run` with `bash -e`, and
+          # govulncheck exits 3 as soon as it finds one vulnerability: without
+          # it the step dies on the call and the accepted list below is never
+          # evaluated.
+          set +e -uo pipefail
+          # Pinned: the tool is versioned here, the vulnerability database is
+          # always the live one.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0 || exit 1
+          govulncheck ./... > govulncheck-report.txt 2>&1
+          rc=$?
+          cat govulncheck-report.txt
+
+          REACHABLE=$(grep -oE '^Vulnerability #[0-9]+: GO-[0-9]+-[0-9]+' govulncheck-report.txt \
+            | grep -oE 'GO-[0-9]+-[0-9]+' | sort -u)
+
+          # Accepted and tracked exception: GO-2026-5051, in
+          # github.com/hirochachacha/go-smb2. Out-of-bounds read on a malicious
+          # SMB server. "Fixed in: N/A" upstream: the fix only exists in a
+          # community fork under another import path, so this is a dependency
+          # migration, not a version bump. Remove the entry the day upstream
+          # ships a fix, not before.
+          ACCEPTED="GO-2026-5051"
+          UNEXPECTED=$(comm -23 <(echo "$REACHABLE") <(echo "$ACCEPTED") 2>/dev/null | sed '/^$/d')
+
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error title=govulncheck::Reachable vulnerabilities outside the accepted list: ${UNEXPECTED//$'\n'/ }"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ] && [ -z "$REACHABLE" ]; then
+            echo "::error title=govulncheck::Exited $rc with no parseable finding: tool or network error, not a known vulnerability."
+            exit "$rc"
+          fi
+          echo "govulncheck: clean except the accepted, tracked exception ($ACCEPTED)."
